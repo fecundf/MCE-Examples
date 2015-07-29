@@ -38,9 +38,12 @@ sub {
    sleep 0.1 if MCE->task_wid > 1;
 
    while (defined (my $dir = $D->dequeue_nb)) {
-      my (@files, @dirs); foreach (glob(qq["$dir/*"])) {
-         if (-d $_) { push @dirs, $_; next; }
-         push @files, $_;
+       my (@files, @dirs);
+       opendir my($DH),$dir;
+       foreach (grep !/^\.\.?$/, readdir $DH) {
+	 my $path = "$dir/$_";
+         if (-d $path) { push @dirs, $path; }
+         else { push @files, $path; }
       }
       $D->enqueue(@dirs ) if scalar @dirs;
       $F->enqueue(@files) if scalar @files;
