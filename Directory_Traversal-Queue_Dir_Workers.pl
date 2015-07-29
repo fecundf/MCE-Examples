@@ -38,7 +38,7 @@ sub {
    sleep 0.1 if MCE->task_wid > 1;
 
    while (defined (my $dir = $D->dequeue_nb)) {
-      my (@files, @dirs); foreach (glob("$dir/*")) {
+      my (@files, @dirs); foreach (glob(qq["$dir/*"])) {
          if (-d $_) { push @dirs, $_; next; }
          push @files, $_;
       }
