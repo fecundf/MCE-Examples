@@ -11,6 +11,7 @@ BEGIN {
 use File::Spec::Functions 'catfile';
 use Time::HiRes qw(time);
 use MCE;
+use MCE::Queue;
 
 
 # Get the directories to start with
@@ -23,18 +24,18 @@ my $start = time;
 # Each proces gets their own copy of $bytes, $files
 my ($bytes, $files) = (0,0);
 
-my $shared_work = Shared::Queue::Simple->new;
-$shared_work->enqueue($_) for @start_dirs;
-
-my $free_count :shared = 0;
+# Globally shared queue, and count of how many free workers
+our $shared_work = MCE::Queue->new( fast => 1, queue => \@start_dirs );
+our $free_count :shared = 0;
 
 my $mce = MCE->new(
   chunk_size => 1,
   max_workers => 'auto',
-  input_data => sub { $shared_work->dequeue },
   user_begin => sub { $free_count = lock($free_count) + 1 },
   gather => sub { $bytes += $_[0]; $files += $_[1] },
-  user_func => \&traverse
+  user_func => sub {
+    traverse() while ($_ = $shared_work->dequeue, defined)
+  }
 );
 
 my $max_workers = $mce->max_workers;
@@ -44,39 +45,41 @@ sub traverse {
   { $free_count = lock($free_count) - 1 }
   my @work = $_;
 
-  while ($_ = pop @work, defined) {
-    my @paths;
-    if (ref || substr($_,0,1) eq "\x00" ) {
+  while ($_ = shift @work, defined) {
+    if (ref) {
       # This is an array of paths, first element is directory name
-      @paths = (ref) ? @$_ : split /\x00/,substr($_,1);
-      my $dir = shift @paths;
-      for my $path (@paths) {
+      my $dir = shift @$_;
+      for my $path (@$_) {
 	# This is the work we want to do,
 	# what Find::File would call its "wanted" callback.
 	$path = catfile($dir,$path);
 	-f $path ? ( $bytes += -s _, ++$files ) :
 	  push @work, $path;
       }
+
     } else {
+
       # This is a directory, expand it
-      my $dir = $_;
-      opendir DH,$dir or die "Cannot opendir $dir: $!";
+      my ($dir,@paths) = ($_);
+      opendir DH,$dir or die "Internal error, cannot opendir $dir: $!";
       for (readdir DH) {
 	next if $_ eq '.' || $_ eq '..';
-	if ($free_count && @work && -d (my $subd = catfile($dir,$_))) {
+	my $subd;
+	$free_count && @work && -d ($subd = catfile($dir,$_)) ?
 	  # Someone else is free, and we have more work to do
-	  $shared_work->enqueue($subd);
-	} else {
+	  $shared_work->enqueue($subd)
+	  :
+	  # This worker will handle this path
 	  push @paths,$_;
-	}
       }
+
+      next unless @paths; # Empty directory
+
       if ($free_count && @paths > 1 + lock($free_count)) {
 	# Divide up this work among the free workers
 	my $give_count = int(@paths / (1 + $free_count));
 	$shared_work->enqueue(
-	  # Tried shared_clone( [ $dir , splice(@paths,-$give_count) ] ),
-	  # got perl crashes :-(
-	  join( "\x00", '', $dir , splice(@paths,-$give_count) )
+	  [ $dir , splice(@paths,-$give_count) ]
 	) for (1 .. $free_count);
       }
       unshift @paths, $dir;
@@ -90,7 +93,7 @@ sub traverse {
 
   # Done with our work, let everyone know we're free
   $free_count = 1 + lock($free_count);
-  $shared_work->enqueue(undef) if $free_count == $max_workers;
+  $free_count == $max_workers && $shared_work->enqueue((undef) x $max_workers);
 }
 
 
@@ -112,34 +115,3 @@ sub show_results {
 
 show_results('Collab',$bytes,$files);
 printf "Duration: %0.3f seconds\n", time() - $start;
-
-
-# Done with main code
-# Mock-up a threads::shared queue
-package Shared::Queue::Simple;
-BEGIN {
-  eval 'use threads;use threads::shared; 1'
-    || eval 'use forks;use forks::shared;1'
-    || die 'Need to install "forks::shared" or "threads::shared"';
-}
-use Carp qw'verbose cluck';
-
-sub new {
-  my @Q :shared;
-  bless \@Q, shift @_;
-}
-
-sub enqueue {
-  my $self = shift;
-  lock($self);
-  push @$self, @_;
-  cond_broadcast($self);
-}
-
-sub dequeue {
-  my ($self) = @_;
-
-  lock($self);
-  cond_wait($self) until @$self;
-  return shift @$self;
-}
